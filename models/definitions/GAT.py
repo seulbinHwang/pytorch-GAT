@@ -19,6 +19,16 @@ class GAT(torch.nn.Module):
 
     def __init__(self, num_of_layers, num_heads_per_layer, num_features_per_layer, add_skip_connection=True, bias=True,
                  dropout=0.6, layer_type=LayerType.IMP3, log_attention_weights=False):
+        """
+        :param num_of_layers: 2
+        :param num_heads_per_layer: [8, 1]
+        :param num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+        :param add_skip_connection: False
+        :param bias: True
+        :param dropout: 0.6 # result is sensitive to dropout
+        :param layer_type: LayerType.IMP3
+        :param log_attention_weights: False
+        """
         super().__init__()
         assert num_of_layers == len(num_heads_per_layer) == len(num_features_per_layer) - 1, f'Enter valid arch params.'
 
@@ -139,6 +149,12 @@ class GATLayer(torch.nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def skip_concat_bias(self, attention_coefficients, in_nodes_features, out_nodes_features):
+        """
+        :param attention_coefficients: -> all_attention_coefficients  (NH, N, N)
+        :param in_nodes_features: ( N, FIN )
+        :param out_nodes_features: (N, NH, FOUT)
+        :return:
+        """
         if self.log_attention_weights:  # potentially log for later visualization in playground.py
             self.attention_weights = attention_coefficients
 
@@ -189,7 +205,49 @@ class GATLayerImp3(GATLayer):
 
     def __init__(self, num_in_features, num_out_features, num_of_heads, concat=True, activation=nn.ELU(),
                  dropout_prob=0.6, add_skip_connection=True, bias=True, log_attention_weights=False):
+        """
+        :param num_in_features: num_features_per_layer[i] * num_heads_per_layer[i],  # consequence of concatenation
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: CORA_NUM_INPUT_FEATURES * 8
+                - 2: 8 * 1
 
+        :param num_out_features: num_features_per_layer[i+1],
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - conclusion
+                1: 8
+                2: 7
+
+        :param num_of_heads: num_heads_per_layer[i+1],
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: 1
+                - 2: 1 (TODO: check)
+
+        :param concat: True if i < num_of_layers - 1 else False,  # last GAT layer does mean avg, the others do concat
+            - conclusion
+                - 1: True
+                - 2: False
+
+        :param activation: nn.ELU() if i < num_of_layers - 1 else None,  # last layer just outputs raw scores
+            - conclusion
+                - 1: nn.ELU()
+                - 2: None
+
+        :param dropout_prob: dropout
+            - 0.6
+
+        :param add_skip_connection: add_skip_connection
+            - False
+
+        :param bias: bias
+            - True
+
+        :param log_attention_weights: log_attention_weights
+            - False
+
+        """
         # Delegate initialization to the base class
         super().__init__(num_in_features, num_out_features, num_of_heads, LayerType.IMP3, concat, activation, dropout_prob,
                       add_skip_connection, bias, log_attention_weights)
@@ -198,7 +256,12 @@ class GATLayerImp3(GATLayer):
         #
         # Step 1: Linear Projection + regularization
         #
-
+        """
+        :param data:
+            - in_nodes_features: ( N(num_of_nodes), FIN(number of input features per node) )
+            - edge_index: (2, E) # not (num_of_nodes, num_of_nodes)
+        :return:
+        """
         in_nodes_features, edge_index = data  # unpack data
         num_of_nodes = in_nodes_features.shape[self.nodes_dim]
         assert edge_index.shape[0] == 2, f'Expected edge index with shape=(2,E) got {edge_index.shape}'
@@ -221,15 +284,18 @@ class GATLayerImp3(GATLayer):
         # Apply the scoring function (* represents element-wise (a.k.a. Hadamard) product)
         # shape = (N, NH, FOUT) * (1, NH, FOUT) -> (N, NH, 1) -> (N, NH) because sum squeezes the last dimension
         # Optimization note: torch.sum() is as performant as .sum() in my experiments
-        scores_source = (nodes_features_proj * self.scoring_fn_source).sum(dim=-1)
-        scores_target = (nodes_features_proj * self.scoring_fn_target).sum(dim=-1)
+        scores_source = (nodes_features_proj * self.scoring_fn_source).sum(dim=-1) # (N, NH)
+        scores_target = (nodes_features_proj * self.scoring_fn_target).sum(dim=-1) # (N, NH)
 
         # We simply copy (lift) the scores for source/target nodes based on the edge index. Instead of preparing all
         # the possible combinations of scores we just prepare those that will actually be used and those are defined
         # by the edge index.
-        # scores shape = (E, NH), nodes_features_proj_lifted shape = (E, NH, FOUT), E - number of edges in the graph
+
+        # node_features_proj: (N, NH, FOUT)
+
+        # scores_source_lifted / scores_target_lifted = (E, NH), nodes_features_proj_lifted = (E, NH, FOUT), E - number of edges in the graph
         scores_source_lifted, scores_target_lifted, nodes_features_proj_lifted = self.lift(scores_source, scores_target, nodes_features_proj, edge_index)
-        scores_per_edge = self.leakyReLU(scores_source_lifted + scores_target_lifted)
+        scores_per_edge = self.leakyReLU(scores_source_lifted + scores_target_lifted) # (E, NH) + (E, NH) = (E, NH)
 
         # shape = (E, NH, 1)
         attentions_per_edge = self.neighborhood_aware_softmax(scores_per_edge, edge_index[self.trg_nodes_dim], num_of_nodes)
@@ -245,6 +311,11 @@ class GATLayerImp3(GATLayer):
         nodes_features_proj_lifted_weighted = nodes_features_proj_lifted * attentions_per_edge
 
         # This part sums up weighted and projected neighborhood feature vectors for every target node
+        # nodes_features_proj_lifted_weighted # (E, NH, FOUT)
+        # edge_index = (2, H)
+        # in_nodes_features = (N, FIN)
+        # num_of_nodes: N
+
         # shape = (N, NH, FOUT)
         out_nodes_features = self.aggregate_neighbors(nodes_features_proj_lifted_weighted, edge_index, in_nodes_features, num_of_nodes)
 
@@ -260,6 +331,12 @@ class GATLayerImp3(GATLayer):
     #
 
     def neighborhood_aware_softmax(self, scores_per_edge, trg_index, num_of_nodes):
+        """
+        :param scores_per_edge: (E, NH)
+        :param trg_index: E
+        :param num_of_nodes: N
+        :return:
+        """
         """
         As the fn name suggest it does softmax over the neighborhoods. Example: say we have 5 nodes in a graph.
         Two of them 1, 2 are connected to node 3. If we want to calculate the representation for node 3 we should take
@@ -278,9 +355,9 @@ class GATLayerImp3(GATLayer):
         """
         # Calculate the numerator. Make logits <= 0 so that e^logit <= 1 (this will improve the numerical stability)
         scores_per_edge = scores_per_edge - scores_per_edge.max()
-        exp_scores_per_edge = scores_per_edge.exp()  # softmax
+        exp_scores_per_edge = scores_per_edge.exp()  # softmax # (E, NH)
 
-        # Calculate the denominator. shape = (E, NH)
+        # Calculate the denominator. shape = (E, NH) # trg_index = E / num_of_nodes = N
         neigborhood_aware_denominator = self.sum_edge_scores_neighborhood_aware(exp_scores_per_edge, trg_index, num_of_nodes)
 
         # 1e-16 is theoretically not needed but is only there for numerical stability (avoid div by 0) - due to the
@@ -291,16 +368,18 @@ class GATLayerImp3(GATLayer):
         return attentions_per_edge.unsqueeze(-1)
 
     def sum_edge_scores_neighborhood_aware(self, exp_scores_per_edge, trg_index, num_of_nodes):
-        # The shape must be the same as in exp_scores_per_edge (required by scatter_add_) i.e. from E -> (E, NH)
+        # The shape must be the same as in exp_scores_per_edge (required by scatter_add_)
+        # i.e. fromtrg_index: E -> trg_index_broadcasted: (E, NH)
         trg_index_broadcasted = self.explicit_broadcast(trg_index, exp_scores_per_edge)
 
         # shape = (N, NH), where N is the number of nodes and NH the number of attention heads
-        size = list(exp_scores_per_edge.shape)  # convert to list otherwise assignment is not possible
-        size[self.nodes_dim] = num_of_nodes
-        neighborhood_sums = torch.zeros(size, dtype=exp_scores_per_edge.dtype, device=exp_scores_per_edge.device)
+        size = list(exp_scores_per_edge.shape) # (E, NH)  # convert to list otherwise assignment is not possible
+        size[self.nodes_dim] = num_of_nodes # [N, NH]
+        neighborhood_sums = torch.zeros(size, dtype=exp_scores_per_edge.dtype, device=exp_scores_per_edge.device) # [N, NH]
 
         # position i will contain a sum of exp scores of all the nodes that point to the node i (as dictated by the
         # target index)
+        # [N, NH] / 0 / [E, NH] , [E, NH]
         neighborhood_sums.scatter_add_(self.nodes_dim, trg_index_broadcasted, exp_scores_per_edge)
 
         # Expand again so that we can use it as a softmax denominator. e.g. node i's sum will be copied to
@@ -309,6 +388,12 @@ class GATLayerImp3(GATLayer):
         return neighborhood_sums.index_select(self.nodes_dim, trg_index)
 
     def aggregate_neighbors(self, nodes_features_proj_lifted_weighted, edge_index, in_nodes_features, num_of_nodes):
+        # nodes_features_proj_lifted_weighted # (E, NH, FOUT)
+        # edge_index = (2, H)
+        # in_nodes_features = (N, FIN)
+        # num_of_nodes: N
+
+        # shape = (N, NH, FOUT)
         size = list(nodes_features_proj_lifted_weighted.shape)  # convert to list otherwise assignment is not possible
         size[self.nodes_dim] = num_of_nodes  # shape = (N, NH, FOUT)
         out_nodes_features = torch.zeros(size, dtype=in_nodes_features.dtype, device=in_nodes_features.device)
@@ -323,27 +408,41 @@ class GATLayerImp3(GATLayer):
 
     def lift(self, scores_source, scores_target, nodes_features_matrix_proj, edge_index):
         """
+        :param scores_source: (N, NH) -----------------> (E, NH)
+        :param scores_target: (N, NH) -----------------> (E, NH)
+        :param nodes_features_matrix_proj: (N, NH, FOUT) -----------------> nodes_features_matrix_proj_lifted (E, NH, FOUT)
+        :param edge_index: (2, H)
+        :return:
+        """
+        """
         Lifts i.e. duplicates certain vectors depending on the edge index.
         One of the tensor dims goes from N -> E (that's where the "lift" comes from).
-
         """
-        src_nodes_index = edge_index[self.src_nodes_dim]
-        trg_nodes_index = edge_index[self.trg_nodes_dim]
+        src_nodes_index = edge_index[self.src_nodes_dim] # position of source nodes in edge index = 0 # (H)
+        trg_nodes_index = edge_index[self.trg_nodes_dim] # position of target nodes in edge index = 1 # (H)
 
         # Using index_select is faster than "normal" indexing (scores_source[src_nodes_index]) in PyTorch!
-        scores_source = scores_source.index_select(self.nodes_dim, src_nodes_index)
-        scores_target = scores_target.index_select(self.nodes_dim, trg_nodes_index)
+        # self.nodes_dim = 0
+        # (N, NH) -> (E, NH)
+        scores_source = scores_source.index_select(self.nodes_dim, src_nodes_index) # 0 ,edge_index(H)
+        scores_target = scores_target.index_select(self.nodes_dim, trg_nodes_index) # 0 ,edge_index(H)
+        # (N, NH, FOUT) -> (E, NH, FOUT)
         nodes_features_matrix_proj_lifted = nodes_features_matrix_proj.index_select(self.nodes_dim, src_nodes_index)
 
         return scores_source, scores_target, nodes_features_matrix_proj_lifted
 
     def explicit_broadcast(self, this, other):
+        """
+        :param this: E
+        :param other: E, NH
+        :return:
+        """
         # Append singleton dimensions until this.dim() == other.dim()
         for _ in range(this.dim(), other.dim()):
-            this = this.unsqueeze(-1)
+            this = this.unsqueeze(-1) # E -> (E, 1)
 
         # Explicitly expand so that shapes are the same
-        return this.expand_as(other)
+        return this.expand_as(other) # (E, 1) -> (E, H)
 
 
 class GATLayerImp2(GATLayer):
@@ -360,7 +459,49 @@ class GATLayerImp2(GATLayer):
 
     def __init__(self, num_in_features, num_out_features, num_of_heads, concat=True, activation=nn.ELU(),
                  dropout_prob=0.6, add_skip_connection=True, bias=True, log_attention_weights=False):
+        """
+        :param num_in_features: num_features_per_layer[i] * num_heads_per_layer[i],  # consequence of concatenation
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: CORA_NUM_INPUT_FEATURES * 8
+                - 2: 8 * 1
 
+        :param num_out_features: num_features_per_layer[i+1],
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - conclusion
+                1: 8
+                2: 7
+
+        :param num_of_heads: num_heads_per_layer[i+1],
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: 1
+                - 2: 1 (TODO: check)
+
+        :param concat: True if i < num_of_layers - 1 else False,  # last GAT layer does mean avg, the others do concat
+            - conclusion
+                - 1: True
+                - 2: False
+
+        :param activation: nn.ELU() if i < num_of_layers - 1 else None,  # last layer just outputs raw scores
+            - conclusion
+                - 1: nn.ELU()
+                - 2: None
+
+        :param dropout_prob: dropout
+            - 0.6
+
+        :param add_skip_connection: add_skip_connection
+            - False
+
+        :param bias: bias
+            - True
+
+        :param log_attention_weights: log_attention_weights
+            - False
+
+        """
         super().__init__(num_in_features, num_out_features, num_of_heads, LayerType.IMP2, concat, activation, dropout_prob,
                          add_skip_connection, bias, log_attention_weights)
 
@@ -368,7 +509,12 @@ class GATLayerImp2(GATLayer):
         #
         # Step 1: Linear Projection + regularization (using linear layer instead of matmul as in imp1)
         #
-
+        """
+        :param data:
+            - in_nodes_features: ( N(num_of_nodes), FIN(number of input features per node) )
+            - connectivity_mask: (num_of_nodes, num_of_nodes)
+        :return:
+        """
         in_nodes_features, connectivity_mask = data  # unpack data
         num_of_nodes = in_nodes_features.shape[0]
         assert connectivity_mask.shape == (num_of_nodes, num_of_nodes), \
@@ -378,7 +524,7 @@ class GATLayerImp2(GATLayer):
         # We apply the dropout to all of the input node features (as mentioned in the paper)
         in_nodes_features = self.dropout(in_nodes_features)
 
-        # shape = (N, FIN) * (FIN, NH*FOUT) -> (N, NH, FOUT) where NH - number of heads, FOUT - num of output features
+        # shape = (N, FIN) * (FIN, NH*FOUT) -> (N, NH * FOUT) -> (N, NH, FOUT) where NH - number of heads, FOUT - num of output features
         # We project the input node features into NH independent output features (one for each attention head)
         nodes_features_proj = self.linear_proj(in_nodes_features).view(-1, self.num_of_heads, self.num_out_features)
 
@@ -395,16 +541,16 @@ class GATLayerImp2(GATLayer):
         scores_target = torch.sum((nodes_features_proj * self.scoring_fn_target), dim=-1, keepdim=True)
 
         # src shape = (NH, N, 1) and trg shape = (NH, 1, N)
-        scores_source = scores_source.transpose(0, 1)
-        scores_target = scores_target.permute(1, 2, 0)
+        scores_source = scores_source.transpose(0, 1) # (NH, N, 1)
+        scores_target = scores_target.permute(1, 2, 0) # (NH, 1, N)
 
         # shape = (NH, N, 1) + (NH, 1, N) -> (NH, N, N) with the magic of automatic broadcast <3
         # In Implementation 3 we are much smarter and don't have to calculate all NxN scores! (only E!)
         # Tip: it's conceptually easier to understand what happens here if you delete the NH dimension
-        all_scores = self.leakyReLU(scores_source + scores_target)
+        all_scores = self.leakyReLU(scores_source + scores_target) # (NH, N, N)
         # connectivity mask will put -inf on all locations where there are no edges, after applying the softmax
         # this will result in attention scores being computed only for existing edges
-        all_attention_coefficients = self.softmax(all_scores + connectivity_mask)
+        all_attention_coefficients = self.softmax(all_scores + connectivity_mask) # (NH, N, N) + (NH, N, N) = (NH, N, N)
 
         #
         # Step 3: Neighborhood aggregation (same as in imp1)
@@ -438,10 +584,58 @@ class GATLayerImp1(GATLayer):
 
         super().__init__(num_in_features, num_out_features, num_of_heads, LayerType.IMP1, concat, activation, dropout_prob,
                          add_skip_connection, bias, log_attention_weights)
+        """
+        :param num_in_features: num_features_per_layer[i] * num_heads_per_layer[i],  # consequence of concatenation
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: CORA_NUM_INPUT_FEATURES * 8
+                - 2: 8 * 1
 
+        :param num_out_features: num_features_per_layer[i+1],
+            - num_features_per_layer: [CORA_NUM_INPUT_FEATURES, 8, CORA_NUM_CLASSES] # [1433, 8, 7]
+            - conclusion
+                1: 8
+                2: 7
+
+        :param num_of_heads: num_heads_per_layer[i+1],
+            - num_heads_per_layer: [8, 1]
+            - conclusion
+                - 1: 1
+                - 2: 1 (TODO: check)
+
+        :param concat: True if i < num_of_layers - 1 else False,  # last GAT layer does mean avg, the others do concat
+            - conclusion
+                - 1: True
+                - 2: False
+
+        :param activation: nn.ELU() if i < num_of_layers - 1 else None,  # last layer just outputs raw scores
+            - conclusion
+                - 1: nn.ELU()
+                - 2: None
+
+        :param dropout_prob: dropout
+            - 0.6
+
+        :param add_skip_connection: add_skip_connection
+            - False
+
+        :param bias: bias
+            - True
+
+        :param log_attention_weights: log_attention_weights
+            - False
+
+        """
     def forward(self, data):
+        """
+        :param data:
+            - in_nodes_features: ( N(num_of_nodes), FIN(number of input features per node) )
+            - connectivity_mask: (num_of_nodes, num_of_nodes)
+        :return:
+        """
         #
-        # Step 1: Linear Projection + regularization
+        # Step 1: matmul( imp2: Linear Projection + regularization)
         #
 
         in_nodes_features, connectivity_mask = data  # unpack data
@@ -461,7 +655,7 @@ class GATLayerImp1(GATLayer):
 
         #
         # Step 2: Edge attention calculation
-        #
+        # (using bmm + additional permute calls instead of sum - compared to imp2)
 
         # Apply the scoring function (* represents element-wise (a.k.a. Hadamard) product)
         # batch matrix multiply, shape = (NH, N, FOUT) * (NH, FOUT, 1) -> (NH, N, 1)
